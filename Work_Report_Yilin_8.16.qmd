@@ -1,0 +1,266 @@
+---
+title: "data_integration"
+format: html
+editor: 
+  name: "Yilin Wu"
+---
+
+# Batch effect correction pipeline
+## pre-processing
+There are necessary steps before correction-- filtering, normalization, identifying highly variable genes, scaling the expression matrix.
+
+```{r}
+#| message: false
+#| warning: false
+library(Seurat)
+library(data.table)
+library(Matrix)
+library(sparseMatrixStats)
+```
+
+load dataset
+
+```{r}
+read_GSE115978 <- function(data_path) {
+  cat("Reading GSE115978 dataset using fread...\n")
+  
+  counts_path <- file.path(data_path, "GSE115978", "GSE115978_counts.csv.gz")
+  anno_path <- file.path(data_path, "GSE115978", "GSE115978_cell.annotations.csv.gz")
+  
+  counts_dt <- fread(counts_path)
+  gene_names <- counts_dt[[1]]
+  counts_mat <- as.data.frame(counts_dt[, -1, with = FALSE])
+  rownames(counts_mat) <- gene_names
+
+  anno_df <- fread(anno_path)
+  anno_df <- as.data.frame(anno_df)
+  rownames(anno_df) <- anno_df$cells
+  
+  common_cells <- intersect(colnames(counts_mat), anno_df$cells)
+  counts_mat <- counts_mat[, common_cells, drop = FALSE]
+  anno_df <- anno_df[common_cells, , drop = FALSE]
+  
+  seurat_obj <- CreateSeuratObject(
+    counts = counts_mat,
+    meta.data = anno_df,
+    project = "GSE115978"
+  )
+  
+  seurat_obj$batch <- "GSE115978"
+  seurat_obj$study <- "GSE115978"
+  
+  cat("GSE115978:", ncol(seurat_obj), "cells,", nrow(seurat_obj), "genes\n")
+  return(seurat_obj)
+}
+data_path<- "C:/Users/Administrator/Downloads"
+reads_GSE115978<-read_GSE115978(data_path)
+```
+
+```{r}
+
+head(reads_GSE115978$nFeature_RNA,3)  # colSums(counts>0) non-zero entries
+
+head(reads_GSE115978$nCount_RNA,3)  # colSums(counts) total number of UMI counts per cell
+```
+
+```{r}
+hist(reads_GSE115978$nCount_RNA,
+     breaks = 100)
+```
+Calculate for each cell its total number of reads.
+It is zero-inflated because of dropout event,commonly seen in sc RNA analysis.
+AND this histogram shows a strong right-skewed distribution. Normally, we do log-transform to reduce skewness. 
+
+```
+```{r}
+hist(log10(reads_GSE115978$nCount_RNA),breaks=100)
+```
+
+```{r}
+#GSE115978
+seurat_115978 <- NormalizeData(object = reads_GSE115978, normalization.method = "LogNormalize", scale.factor = 10000)
+```
+
+```{r}
+
+count_matrix<-GetAssayData(reads_GSE115978, slot = "counts")
+frac <- t(t(count_matrix) / reads_GSE115978$nCount_RNA)
+plot (rowMeans(frac),rowVars(frac)/rowMeans(frac),log="xy",cex=.2,col=adjustcolor("black",alpha=.2))
+
+ntilde<-1/mean(1/ reads_GSE115978$nCount_RNA)
+abline(h=1/ntilde,col="purple")
+```
+
+```{r}
+#| message: false
+#| warning: false
+seurat_115978 <- FindVariableFeatures(object = seurat_115978, selection.method = "vst",
+  nfeatures = 2000
+)
+```
+
+```{r}
+head(VariableFeatures(seurat_115978))
+```
+
+```{r}
+seurat_115978 <- ScaleData(
+  seurat_115978, features = VariableFeatures(seurat_115978)
+)
+```
+## Dimension Reduction
+```{r}
+#mat <- t(GetAssayData(seurat_115978, slot = "scale.data"))
+#pca <- irlba::prcomp_irlba( mat, n=20, center=TRUE, scale.=TRUE )
+#plot(pca$x[,1],pca$x[,2],cex=.1,col="#00000030",asp=1,ylim=c(-20,20))
+
+seurat_115978 <- RunPCA(
+  seurat_115978,
+  features = VariableFeatures(seurat_115978),
+  npcs = 20,
+  verbose = FALSE
+)
+DimPlot(seurat_115978, reduction = "pca", dims = c(1,2), group.by = "samples")
+```
+
+```{r}
+#uwot::umap(pca$x)->umap
+#plot(umap,cex=.1,col="#00000030",asp=1)
+seurat_115978 <- RunUMAP(
+  seurat_115978, dims = 1:20,
+  umap.method = "uwot", n.neighbors = 15, min.dist = 0.3, seed.use = 42
+)
+DimPlot(seurat_115978, reduction = "umap", group.by = "samples")
+DimPlot(seurat_115978, reduction = "umap", group.by = "treatment.group")
+```
+The UMAP plot colored by treatment group shows good mixing--- no obvious treatment-related batch effect.
+```{r}
+DimPlot(seurat_115978, reduction = "umap", group.by = "cell.types")
+```
+
+Major lineages like T and B cells are separated, but T-cell subtypes (T.cell and T.CD4 and T.CD8 overlap) are hard to tell, which is biologically sensible.
+This plot also shows that the differences within each lineage are more subtle.
+
+```{r}
+FeaturePlot(seurat_115978, features=c("CD3D","IL7R","CD8A","NKG7","MS4A1","LYZ","EPCAM","PECAM1","COL1A1"))
+```
+canonical lineage markers.
+
+#Unsupervised clustering, graph-based community detection
+```{r}
+seurat_obj <- FindNeighbors(seurat_115978, dims = 1:20, k.param = 20)
+##normal matrix
+adjm <- as.matrix(seurat_obj@graphs$RNA_nn) 
+head(adjm[, 1:5])
+##sparse matrix
+adjm_sparse <- seurat_obj@graphs$RNA_nn
+head(adjm_sparse[, 1:5])
+
+colSums(adjm_sparse) -> vertex_degrees
+hist( vertex_degrees,breaks=30 )
+```
+A few cells have very high degrees-- these might be hub nodes
+cells with very low degrees may be isolated in te data, could be labeled as outliers.
+
+seurat_obj@graphs$RNA_nn is a symmetric adjacency
+
+we check hub cells which 
+```{r}
+mean_deg <- mean(vertex_degrees)
+sd_deg <- sd(vertex_degrees)
+
+hub_threshold <- mean_deg + 3 * sd_deg
+hub_cells <- which(vertex_degrees > hub_threshold)
+cat("The number of Hub cells :", length(hub_cells), "\n")
+hist(vertex_degrees, breaks=50, main="Degree distribution with thresholds", xlab="Degree")
+abline(v = hub_threshold, col="red", lwd=2, lty=2)
+```
+undirected graph
+
+```{r}
+pca_matrix <- seurat_obj@reductions$pca@cell.embeddings
+head(pca_matrix)
+library(FNN)
+nn <- get.knn(pca_matrix, k = 20)$nn.index
+head(nn)
+library(Matrix)
+adjm_directed <- sparseMatrix(
+  i = rep(1:nrow(nn), ncol(nn)),  
+  j = as.vector(nn),              
+  x = 1,
+  dims = c(nrow(nn), nrow(nn))
+)
+
+adjm_undirected <- adjm_directed + t(adjm_directed)  
+adjm_undirected[adjm_undirected > 1] <- 1            
+vertex_degrees_undirected <- rowSums(adjm_undirected)
+hist(vertex_degrees_undirected,breaks=50)
+```
+The minimum is 20 but a vertex can habe much more neighbors due to non-mutual neighboprhood relations.
+
+ Now we use the igraph package to build this graph and  perform modularity clustering 
+```{r}
+igraph::graph_from_adjacency_matrix(adjm_undirected , mode="undirected" ) -> nn_graph
+
+nn_graph
+
+igraph::cluster_leiden( nn_graph, objective_function="modularity" ) -> clustering
+
+str(clustering)
+seurat_115978$leiden_clusters <- factor(clustering$membership)
+DimPlot(seurat_115978, reduction = "umap", group.by = "leiden_clusters")
+```
+
+```{r}
+stopifnot( all(adjm_undirected@x!=0) ) #pass
+library(tibble)
+adjm_triplet <- as(adjm_undirected, "dgTMatrix")
+
+edge_table <-tibble( from=adjm_triplet@i+1, to=adjm_triplet@j+1 ) %>%
+ dplyr::filter(.data$from < .data$to)
+
+head(edge_table)
+library(dplyr)
+edge_table_clustered <- edge_table %>%
+  mutate( 
+    from_cluster = clustering$membership[from],
+    to_cluster   = clustering$membership[to]
+  )
+
+head(edge_table_clustered)
+```
+check the quality of the Leiden clustering
+```{r}
+##edges across different clusters
+sum( edge_table_clustered$from_cluster != edge_table_clustered$to_cluster )
+##proportion of edges inside clusters
+mean( edge_table_clustered$from_cluster == edge_table_clustered$to_cluster ) -> fraction_inner
+fraction_inner
+```
+91.2% of edges are internal-- a good clustering quality.
+```{r}
+edge_table %>%
+mutate( to = sample(to) ) %>%
+mutate( 
+  from_cluster = clustering$membership[ from ],
+  to_cluster   = clustering$membership[ to ] ) %>%
+summarise( mean( from_cluster == to_cluster ) )
+```
+randomly shuffle the "to" column, and calculate the fraction of edges that under this random permutation, still connect nodes wthin the same cluster.
+If you shuffle many times and take the average, you get a stable estimate of the expected fraction of within-cluster edges under randomness.
+
+This average is called J0.
+
+how much connectivity (total degree) each cluster holds.
+```{r}
+tapply( vertex_degrees_undirected, clustering$membership, sum ) -> degree_sums
+
+degree_sums
+sum( degree_sums^2 ) / sum( degree_sums )^2 -> expected_fraction_inner
+
+expected_fraction_inner
+fraction_inner - expected_fraction_inner
+clustering$quality
+```
+
+
